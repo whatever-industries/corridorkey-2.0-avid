@@ -6,10 +6,10 @@ Community plug-in for green- and blue-screen keying with [CorridorKey 2.0](https
 
 | Platform | Backend | Status |
 |---|---|---|
-| macOS · Apple Silicon | PyTorch MPS on Metal | Tested in Media Composer 2025.12 with 1080p SDR Rec.709 compositing and 10-bit render output. [Setup and validation](docs/macos.md) |
-| Windows · x64 | NVIDIA CUDA | Derived from the [community Windows port](https://github.com/ber2minsin/corridor-key-v2-avid). This repository’s Windows build awaits validation. [Setup and controls](docs/windows.md) |
+| macOS · Apple Silicon | PyTorch MPS on Metal | Tested in Media Composer 2025.12 with 1080p SDR Rec.709 compositing and 10-bit render output. [Download preview](https://github.com/whatever-industries/corridorkey-2.0-avid/releases/tag/v0.1.0) · [Setup](docs/macos.md) |
+| Windows · x64 | NVIDIA CUDA | Based on the [community Windows port](https://github.com/ber2minsin/corridor-key-v2-avid). A native build and a CUDA render in Media Composer are pending for this repository’s version. [Setup and controls](docs/windows.md) |
 
-This is a source preview. See the [release plan](docs/releases.md) for proposed platform packages.
+See the [release plan](docs/releases.md) for the platform package checklist.
 
 ## Use in Media Composer
 
