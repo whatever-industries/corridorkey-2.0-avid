@@ -1,0 +1,19 @@
+Corridor Key 2.0 installs an AVX2 effect for Avid Media Composer and a local
+CUDA worker powered by the official Corridor Key 2.0 engine
+(https://corridorkey.com/).
+
+What this Setup does
+--------------------
+- Installs CorridorKey.avx into Avid's AVX2 plug-in folders
+- Installs a bundled Python runtime and the Corridor Key 2.0 source tree
+- Optionally downloads model weights and CUDA PyTorch (~6–8 GB)
+
+Requirements
+------------
+- Windows 10 22H2+ or Windows 11 (64-bit)
+- NVIDIA GPU with a current driver
+- Avid Media Composer (not Media Composer First)
+- Internet access for the model / PyTorch download step
+
+Corridor Key 2.0 weights are fetched with the official upstream script from the
+CorridorKey Hugging Face repository and foundation-model publishers.

@@ -1,0 +1,1078 @@
+diff --git a/.gitignore b/.gitignore
+index 71918b2..c8eb6eb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,6 +8,27 @@ __pycache__/
+ venv/
+ .env
+ 
++# macOS
++.DS_Store
++.AppleDouble
++.LSOverride
++Icon?
++._*
++.DocumentRevisions-V100
++.fseventsd
++.Spotlight-V100
++.TemporaryItems
++.Trashes
++.VolumeIcon.icns
++.com.apple.timemachine.donotpresent
++
++# macOS network-share metadata
++.AppleDB
++.AppleDesktop
++Network Trash Folder
++Temporary Items
++.apdisk
++
+ # Large Assets and Pretrained Weights
+ weights/**
+ !weights/**/
+diff --git a/README.md b/README.md
+index c1791f9..10604c6 100644
+--- a/README.md
++++ b/README.md
+@@ -18,9 +18,12 @@ Any business or research inquiries for Zac can be directed to z.brooks.harris@gm
+ 
+ ## Setup
+ 
+-You need an NVIDIA GPU (currently RTX 30-series or newer) with at least 4 GB of VRAM
+-for footage up to 1440p, or 6 GB for 4K, `ffmpeg` on your PATH, and a Python
+-environment with CUDA-enabled PyTorch installed. On smaller cards, see [Long Clips And Low VRAM](#long-clips-and-low-vram).
++You need either an NVIDIA GPU (currently RTX 30-series or newer) or an Apple
++Silicon Mac with an MPS-enabled PyTorch build, plus `ffmpeg` on your PATH. For
++NVIDIA, allow at least 4 GB of VRAM for footage up to 1440p or 6 GB for 4K. On
++Apple Silicon, 32 GB of unified memory is the practical baseline; smaller Macs
++should start with low-VRAM mode and short Hann windows. See
++[Long Clips And Low VRAM](#long-clips-and-low-vram).
+ This package was tested with:
+ 
+ ```
+@@ -29,7 +32,9 @@ torchvision==0.24.1
+ ```
+ 
+ From the repository root, create an environment, install PyTorch and the
+-remaining dependencies, and download the model weights (about 5 GB):
++remaining dependencies, and download the model weights (about 5 GB).
++
++NVIDIA CUDA:
+ 
+ ```
+ python -m venv venv
+@@ -39,6 +44,24 @@ pip install -r requirements.txt
+ python scripts/download_weights.py
+ ```
+ 
++Apple Silicon (native arm64 Python; do not run the terminal under Rosetta):
++
++```
++python3 -m venv venv
++source venv/bin/activate
++pip install torch==2.9.1 torchvision==0.24.1
++pip install -r requirements.txt
++python scripts/download_weights.py
++python infer.py --device mps --help
++```
++
++MPS execution is strict: unsupported Metal operations raise an error rather
++than silently falling back to the CPU. `--device auto` (the default) chooses
++CUDA first and MPS second. Use `--device mps` to require Metal explicitly.
++Inference reports progress separately for foundation features, stage-1 neural
++blocks, and stage-2 output frames. On completion it prints both inference-only
++and total wall-clock runtime.
++
+ The download script fetches:
+ 
+ - the CorridorKey 2.0 weights from
+@@ -56,7 +79,7 @@ The easiest way to run CorridorKey is to drag a clip, a frame-sequence folder,
+ or a folder of clips onto the launcher in the repository root:
+ 
+ - **Windows:** `CorridorKey_DRAG_CLIPS_HERE.bat`
+-- **Linux:** `CorridorKey_DRAG_CLIPS_HERE.sh` (or run it in a terminal and drop
++- **Linux/macOS:** `CorridorKey_DRAG_CLIPS_HERE.sh` (or run it in a terminal and drop
+   the clip into the terminal when asked)
+ 
+ It walks you through the inference mode, outputs, and GPU memory profile, then
+@@ -401,8 +424,9 @@ python infer.py \
+ ## Long Clips And Low VRAM
+ 
+ You normally do not need to set anything here: with no memory flags,
+-CorridorKey measures the free memory on your GPU and picks the Hann window and
+-low-VRAM mode for each clip. As a guide, this is roughly what it selects
++CorridorKey measures the accelerator memory budget and picks the Hann window
++and low-VRAM mode for each clip. The table below was measured on CUDA and is a
++rough starting point for MPS unified memory as well:
+ (window as chunk/stride):
+ 
+ | GPU memory | 720p | 1080p | 1440p | 4K |
+@@ -421,7 +445,8 @@ frame, which gives up temporal context in stage 1 to save memory. Results
+ remain good, with somewhat less frame-to-frame consistency than larger windows.
+ 
+ These come from measurements on synthetic test clips; other software using the
+-GPU reduces what is available. If you hit a CUDA out-of-memory error, pass
++GPU use by other applications reduces what is available. If you hit an
++accelerator out-of-memory error, pass
+ `--low_vram` with a smaller `--hann_chunk` yourself.
+ 
+ The normal path streams video and does not intentionally hold an entire long
+diff --git a/corridorkey/runtime.py b/corridorkey/runtime.py
+index aa74162..4c8af03 100644
+--- a/corridorkey/runtime.py
++++ b/corridorkey/runtime.py
+@@ -4,10 +4,15 @@ import json
+ import os
+ import sys
+ import tempfile
++import time
+ from concurrent.futures import ThreadPoolExecutor
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ 
++# CorridorKey's MPS path is GPU-only. Unsupported operators must fail loudly
++# instead of silently crossing to the CPU.
++os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
++
+ import numpy as np
+ import torch
+ import torch.nn.functional as F
+@@ -147,6 +152,126 @@ _VRAM_PEAK_GB = {
+ }
+ _VRAM_MARGIN_SCALE = 1.1
+ _VRAM_MARGIN_GB = 0.3
++# MPS currently materializes attention score buffers that CUDA SDPA avoids.
++# Calibrated conservatively from the 61-frame 1920x1024 reference run:
++# 19.2 GB CUDA-model estimate versus approximately 52 GB MPS peak.
++_MPS_PEAK_SCALE = 2.75
++
++
++class _InlineProgress:
++    """Dependency-free progress display that only rewrites the current line."""
++
++    def __init__(self, *, total: int, desc: str, unit: str):
++        self.total = max(0, int(total))
++        self.desc = desc.strip()
++        self.unit = unit
++        self.n = 0
++        self.started = time.perf_counter()
++        self.last_rendered = 0.0
++        self.detail = ""
++        self.visible = False
++
++    @staticmethod
++    def _duration(seconds: float) -> str:
++        seconds = max(0, int(seconds))
++        minutes, seconds = divmod(seconds, 60)
++        hours, minutes = divmod(minutes, 60)
++        return (f"{hours:d}:{minutes:02d}:{seconds:02d}"
++                if hours else f"{minutes:02d}:{seconds:02d}")
++
++    def _render(self, *, force: bool = False) -> None:
++        now = time.perf_counter()
++        if not force and now - self.last_rendered < 0.2:
++            return
++        elapsed = now - self.started
++        fraction = min(1.0, self.n / self.total) if self.total else 1.0
++        rate = self.n / elapsed if elapsed > 0 else 0.0
++        remaining = ((self.total - self.n) / rate
++                     if rate > 0 and self.total > self.n else 0.0)
++        message = (
++            f"{self.desc}: {fraction * 100:5.1f}% "
++            f"({self.n}/{self.total} {self.unit}) | "
++            f"elapsed {self._duration(elapsed)}"
++        )
++        if self.total > self.n and rate > 0:
++            message += f" | ETA {self._duration(remaining)}"
++        if self.detail:
++            message += f" | {self.detail}"
++        try:
++            width = os.get_terminal_size(sys.stdout.fileno()).columns
++            message = message[:max(1, width - 1)]
++        except (OSError, ValueError):
++            pass
++        # CR returns to column zero; EL2 clears the entire current line. Unlike
++        # tqdm's nested cursor movement, this cannot create additional rows.
++        sys.stdout.write(f"\r\033[2K{message}")
++        sys.stdout.flush()
++        self.last_rendered = now
++        self.visible = True
++
++    def update(self, amount: int = 1) -> None:
++        self.n = min(self.total, self.n + int(amount))
++        self._render(force=self.n >= self.total)
++
++    def set_postfix_str(self, detail: str) -> None:
++        self.detail = str(detail)
++        self._render()
++
++    def close(self) -> None:
++        if self.visible:
++            sys.stdout.write("\r\033[2K")
++            sys.stdout.flush()
++            self.visible = False
++
++
++def _inline_progress(*, total: int, desc: str, unit: str):
++    return _InlineProgress(total=total, desc=desc, unit=unit)
++
++
++def select_accelerator(requested: str = "auto") -> torch.device:
++    """Select a GPU backend. CPU execution and MPS CPU fallback are forbidden."""
++    requested = str(requested).lower()
++    if requested not in ("auto", "cuda", "mps"):
++        raise ValueError(f"unsupported accelerator {requested!r}")
++    if requested in ("auto", "cuda") and torch.cuda.is_available():
++        return torch.device("cuda")
++    if requested in ("auto", "mps") and torch.backends.mps.is_available():
++        # Setting this after torch import still documents and enforces the
++        # policy for subprocesses; PyTorch's default is already no fallback.
++        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
++        return torch.device("mps")
++    if requested == "cuda":
++        raise RuntimeError("CUDA was requested, but no CUDA GPU is available.")
++    if requested == "mps":
++        built = torch.backends.mps.is_built()
++        raise RuntimeError(
++            "MPS was requested, but it is unavailable "
++            f"(PyTorch built with MPS support: {built}).")
++    raise RuntimeError("CorridorKey requires a CUDA or MPS GPU; CPU fallback is disabled.")
++
++
++def _inference_dtype(device: torch.device) -> torch.dtype:
++    # Match the trained CUDA runtime's dynamic range. Current MPS supports
++    # bf16 autocast, which avoids fp16 overflow on scene-linear HDR plates.
++    return torch.bfloat16
++
++
++def _autocast(device: torch.device):
++    return torch.autocast(device_type=device.type, dtype=_inference_dtype(device))
++
++
++def _empty_accelerator_cache(device: torch.device) -> None:
++    if device.type == "cuda":
++        torch.cuda.empty_cache()
++    elif device.type == "mps":
++        torch.mps.empty_cache()
++
++
++def _synchronize(device: torch.device) -> None:
++    if device.type == "cuda":
++        torch.cuda.synchronize(device)
++    elif device.type == "mps":
++        torch.mps.synchronize()
+ 
+ 
+ def _interp(x: float, points) -> float:
+@@ -187,16 +312,33 @@ def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
+     return 1, 1, True, estimate
+ 
+ 
+-def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:
+-    free_bytes, _ = torch.cuda.mem_get_info()
+-    # Memory this process already holds (the loaded model) is part of the budget.
+-    budget_gb = (free_bytes + torch.cuda.memory_reserved()) / 2**30
+-    chunk, stride, low_vram, estimate = select_vram_profile(shape_hw, num_frames, budget_gb)
++def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int,
++                    device: torch.device) -> None:
++    if device.type == "cuda":
++        free_bytes, _ = torch.cuda.mem_get_info(device)
++        # Memory this process already holds (the loaded model) is part of the budget.
++        budget_bytes = free_bytes + torch.cuda.memory_reserved(device)
++    elif device.type == "mps":
++        recommended = getattr(torch.mps, "recommended_max_memory", None)
++        if recommended is None:
++            raise RuntimeError(
++                "This PyTorch build cannot query the recommended MPS memory limit; "
++                "pass --low_vram and an explicit --hann_chunk.")
++        budget_bytes = recommended()
++    else:
++        raise RuntimeError(f"unsupported inference device: {device}")
++    budget_gb = budget_bytes / 2**30
++    profile_budget_gb = (
++        budget_gb / _MPS_PEAK_SCALE if device.type == "mps" else budget_gb)
++    chunk, stride, low_vram, estimate = select_vram_profile(
++        shape_hw, num_frames, profile_budget_gb)
++    displayed_estimate = estimate * (_MPS_PEAK_SCALE if device.type == "mps" else 1.0)
+     cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
+     print(f"  Auto VRAM: {budget_gb:.1f} GB available at {shape_hw[1]}x{shape_hw[0]} -> "
+           f"hann_chunk={chunk}, hann_stride={stride}, low_vram={low_vram} "
+-          f"(estimated peak {estimate:.1f} GB)")
+-    if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
++          f"(estimated peak {displayed_estimate:.1f} GB"
++          f"{' on MPS' if device.type == 'mps' else ''})")
++    if displayed_estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB > budget_gb:
+         print("  [WARNING] Even a single-frame window may not fit this GPU at this "
+               "resolution. Inference may run out of memory.")
+ 
+@@ -235,7 +377,8 @@ def load_runtime_checkpoint(path: Path) -> dict:
+     return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+ 
+ 
+-def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
++def load_model(paths: RuntimePaths, device: str | torch.device = "cuda") -> CorridorKeyV3:
++    device = torch.device(device)
+     paths.validate()
+     prepare_runtime_environment(paths)
+     ckpt = load_runtime_checkpoint(paths.weights)
+@@ -252,6 +395,7 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
+ 
+     print(f"Loading CorridorKey v2 runtime weights: {paths.weights}")
+     model = CorridorKeyV3(**cfg)
++    model._accelerator_device = device
+     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+     train_missing = [k for k in missing if not k.startswith("foundations.")]
+     train_unexpected = [k for k in unexpected if not k.startswith("foundations.")]
+@@ -265,27 +409,71 @@ def load_model(paths: RuntimePaths, device: str = "cuda") -> CorridorKeyV3:
+     return model
+ 
+ 
+-def configure_low_vram_inference(model, cfg: InferenceConfig):
++def configure_low_vram_inference(model, cfg: InferenceConfig,
++                                 device: torch.device | None = None):
++    device = torch.device(device) if device is not None else model._accelerator_device
++    # CUDA SDPA does not materialize the score matrix, but current MPS SDPA
++    # does. A batch of 16 temporal windows at T=61 and 16x16 spatial tokens
++    # requests ~125 GB, while processing one window at a time requests ~7.8 GB.
++    window_batch = max(0, int(cfg.low_vram_swin_window_batch))
++    if device.type == "mps":
++        window_batch = 1
+     model.stage1.low_vram_enc_frame_chunk = max(0, int(cfg.low_vram_enc_frame_chunk))
+     for module in model.modules():
+         name = module.__class__.__name__
+         if name in ("SwiGLU", "FusionLinSwiglu"):
+             module.inference_chunk_tokens = max(0, int(cfg.low_vram_mlp_chunk_tokens))
+         if name == "SwinAttention3D":
+-            module.inference_window_batch = max(0, int(cfg.low_vram_swin_window_batch))
++            module.inference_window_batch = window_batch
+         if name == "CSwinAttention3D":
+-            module.inference_strip_batch = max(0, int(cfg.low_vram_swin_window_batch))
++            module.inference_strip_batch = window_batch
+         if name in ("FullSpatialAttention2D", "FullAttention3D"):
+             module.inference_query_chunk_tokens = max(
+                 0, int(cfg.low_vram_full_attn_query_chunk_tokens))
+ 
+ 
++def _area_resize_mps(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
++    """MPS implementation of PyTorch's adaptive-average `area` resize.
++
++    MPS adaptive_avg_pool2d currently rejects non-divisible input/output
++    dimensions.  Constructing the same integer pooling bins as two separable
++    matrix multiplies keeps this operation entirely on the GPU and preserves
++    area-mode semantics.
++    """
++    out_h, out_w = size
++    in_h, in_w = x.shape[-2:]
++
++    def weights(in_size: int, out_size: int) -> torch.Tensor:
++        out_idx = torch.arange(out_size, device=x.device)
++        # Integer arithmetic avoids boundary drift when a rational bin edge is
++        # exactly integral (for example 7 * 128 / 28 == 32).
++        starts = torch.div(out_idx * in_size, out_size, rounding_mode="floor")
++        ends = torch.div(
++            (out_idx + 1) * in_size + out_size - 1,
++            out_size, rounding_mode="floor")
++        in_idx = torch.arange(in_size, device=x.device).unsqueeze(0)
++        included = (in_idx >= starts.unsqueeze(1)) & (in_idx < ends.unsqueeze(1))
++        return included.to(x.dtype) / (ends - starts).to(x.dtype).unsqueeze(1)
++
++    weight_h = weights(in_h, out_h)
++    weight_w = weights(in_w, out_w)
++    y = torch.einsum("oh,nchw->ncow", weight_h, x)
++    return torch.einsum("pw,ncow->ncop", weight_w, y)
++
++
++def _area_resize(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
++    if (x.device.type == "mps"
++            and (x.shape[-2] % size[0] or x.shape[-1] % size[1])):
++        return _area_resize_mps(x, size)
++    return F.interpolate(x, size=size, mode="area")
++
++
+ def _build_foundation_inputs(rgb_bt: torch.Tensor):
+     B, T, _, H, W = rgb_bt.shape
+     flat = rgb_bt.reshape(B * T, 3, H, W)
+-    rgb_radio = F.interpolate(flat, size=(H // 4, W // 4), mode="area")
++    rgb_radio = _area_resize(flat, (H // 4, W // 4))
+     H_moge, W_moge = (H * 7) // 32, (W * 7) // 32
+-    rgb_moge = F.interpolate(flat, size=(H_moge, W_moge), mode="area")
++    rgb_moge = _area_resize(flat, (H_moge, W_moge))
+     return (
+         rgb_radio.reshape(B, T, 3, H // 4, W // 4),
+         rgb_moge.reshape(B, T, 3, H_moge, W_moge),
+@@ -320,6 +508,8 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
+     else:
+         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
+     state = None
++    progress = _inline_progress(
++        total=T_all, desc="    RVM features", unit="frame")
+     with ThreadPoolExecutor(max_workers=1) as pool:
+         future = pool.submit(_next_or_none, chunks)
+         while True:
+@@ -334,14 +524,17 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
+                 rgb.reshape(Tc, 3, H, W), size=(H_e, W_e),
+                 mode="bilinear", align_corners=False,
+             ).reshape(1, Tc, 3, H_e, W_e).clamp(0.0, 1.0)
+-            with torch.autocast("cuda", dtype=torch.bfloat16):
++            rgb_rvm = rgb_rvm.to(dtype=_inference_dtype(device))
++            with _autocast(device):
+                 feats, state = model.foundations.rvm(rgb_rvm, state=state)
+             feats_cpu = (feats.float().cpu() - mean) / std
+             out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
++            progress.update(Tc)
+             del rgb, rgb_rvm, feats, feats_cpu, display
++    progress.close()
+     out.flush()
+     del out
+-    torch.cuda.empty_cache()
++    _empty_accelerator_cache(device)
+ 
+ 
+ @torch.no_grad()
+@@ -372,6 +565,8 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
+         chunks = iter_video_frame_chunks(str(source), meta, chunk_size=chunk, need_model=False)
+     else:
+         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
++    progress = _inline_progress(
++        total=T_all, desc="    Foundation features", unit="frame")
+     with ThreadPoolExecutor(max_workers=1) as pool:
+         future = pool.submit(_next_or_none, chunks)
+         while True:
+@@ -381,9 +576,10 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
+             future = pool.submit(_next_or_none, chunks)
+             t0, _model, display = item
+             Tc = display.shape[0]
+-            rgb = display.unsqueeze(0).to(device, non_blocking=True)
++            rgb = display.unsqueeze(0).to(
++                device, dtype=_inference_dtype(device), non_blocking=True)
+             rgb_radio, rgb_moge = _build_foundation_inputs(rgb)
+-            with torch.autocast("cuda", dtype=torch.bfloat16):
++            with _autocast(device):
+                 ff = model.foundations(
+                     rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
+                     rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
+@@ -391,33 +587,37 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
+             moge_out[t0:t0 + Tc] = ff["moge"].float().cpu().numpy()
+             if cradio_out is not None:
+                 cradio_out[t0:t0 + Tc] = ff["cradio"].float().cpu().numpy()
++            progress.update(Tc)
+             del rgb, rgb_radio, rgb_moge, ff, display
++    progress.close()
+     moge_out.flush()
+     del moge_out
+     if cradio_out is not None:
+         cradio_out.flush()
+         del cradio_out
+-    torch.cuda.empty_cache()
++    _empty_accelerator_cache(device)
+     return paths
+ 
+ 
+ def _phase1_setup(model, *, stage1_on_gpu: bool = True):
+-    model.foundations.cuda()
++    device = model._accelerator_device
++    model.foundations.to(device)
+     # Low-VRAM mode precomputes foundation features first, so stage 1 waits on CPU.
+     if stage1_on_gpu:
+-        model.stage1.cuda()
++        model.stage1.to(device)
+     else:
+         model.stage1.cpu()
+     model.stage2.cpu()
+-    torch.cuda.empty_cache()
++    _empty_accelerator_cache(device)
+ 
+ 
+ def _phase2_setup(model):
++    device = model._accelerator_device
+     model.foundations.cpu()
+     model.stage1.cpu()
+-    torch.cuda.empty_cache()
+-    model.stage2.cuda()
+-    torch.cuda.synchronize()
++    _empty_accelerator_cache(device)
++    model.stage2.to(device)
++    _synchronize(device)
+ 
+ 
+ @torch.no_grad()
+@@ -447,6 +647,32 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
+     print(f"    Hann stage1: chunk={chunk}, stride={stride}, "
+           f"windows={len(starts)}, baton_grid={w16}x{h16}")
+ 
++    tracked_blocks = list(model.stage1.enc_16) + list(model.stage1.body_64)
++    tracked_blocks += list(model.stage1.mid_16) + list(model.stage1.dec_16)
++    enc_blocks = len(model.stage1.enc_16)
++    other_blocks = len(tracked_blocks) - enc_blocks
++    frame_chunk = int(getattr(model.stage1, "low_vram_enc_frame_chunk", 0) or 0)
++
++    def block_calls(tc: int) -> int:
++        enc_passes = (
++            (tc + frame_chunk - 1) // frame_chunk
++            if frame_chunk > 0 and tc > frame_chunk else 1)
++        return enc_blocks * enc_passes + other_blocks
++
++    stage1_progress = _inline_progress(
++        total=sum(block_calls(min(t0 + chunk, T_all) - t0) for t0 in starts),
++        desc="    Stage 1 blocks", unit="block")
++    def update_stage1_progress(_module, _inputs, _output):
++        stage1_progress.update(1)
++        # Forward hooks replace a module's output when they return a value.
++        # tqdm.update() returns a bool on refresh, so return None explicitly.
++        return None
++
++    hook_handles = [
++        block.register_forward_hook(update_stage1_progress)
++        for block in tracked_blocks
++    ]
++
+     rvm_map = None
+     if rvm_path is not None:
+         D = model.foundations.rvm.embed_dim
+@@ -481,6 +707,8 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
+         for i, t0 in enumerate(starts):
+             t1 = min(t0 + chunk, T_all)
+             Tc = t1 - t0
++            stage1_progress.set_postfix_str(
++                f"window {i + 1}/{len(starts)} frames {t0}:{t1}")
+             model_chunk, display_chunk, review_chunk = reader.window(t0, t1)
+             hint_cpu = torch.zeros(1, Tc, 1, H, W, dtype=torch.bfloat16)
+             hint_quality_cpu = torch.zeros(1, Tc, dtype=torch.bfloat16)
+@@ -505,14 +733,18 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
+                 for j, t_abs in enumerate(range(t0, t1)):
+                     stage2_frame_cache[t_abs] = model_chunk[j]
+ 
+-            rgb_c = model_chunk.unsqueeze(0).to(device, non_blocking=True)
+-            hint_c = hint_cpu.to(device, non_blocking=True)
+-            hint_quality_c = hint_quality_cpu.to(device, non_blocking=True)
++            compute_dtype = _inference_dtype(device)
++            rgb_c = model_chunk.unsqueeze(0).to(
++                device, dtype=compute_dtype, non_blocking=True)
++            hint_c = hint_cpu.to(device, dtype=compute_dtype, non_blocking=True)
++            hint_quality_c = hint_quality_cpu.to(
++                device, dtype=compute_dtype, non_blocking=True)
+             ff = rgb_radio = rgb_moge = None
+             if foundation_paths is None:
+-                rgb_found = display_chunk.unsqueeze(0).to(device, non_blocking=True)
++                rgb_found = display_chunk.unsqueeze(0).to(
++                    device, dtype=compute_dtype, non_blocking=True)
+                 rgb_radio, rgb_moge = _build_foundation_inputs(rgb_found)
+-                with torch.autocast("cuda", dtype=torch.bfloat16):
++                with _autocast(device):
+                     ff = model.foundations(
+                         rgb_cradio=rgb_radio.reshape(Tc, 3, *rgb_radio.shape[-2:]),
+                         rgb_moge=rgb_moge.reshape(Tc, 3, *rgb_moge.shape[-2:]),
+@@ -528,7 +760,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
+             if rvm_map is not None:
+                 rvm_feat = torch.from_numpy(np.asarray(rvm_map[t0:t1]).copy())
+                 rvm_feat = rvm_feat.unsqueeze(0).to(device, non_blocking=True).float()
+-            with torch.autocast("cuda", dtype=torch.bfloat16):
++            with _autocast(device):
+                 s1 = model.stage1(
+                     rgb_c, hint_c, moge_feat, cradio_feat=cradio_feat,
+                     rvm_feat=rvm_feat, t_stride=1.0,
+@@ -564,10 +796,12 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
+             del rgb_c, hint_c, hint_quality_c, hint_cpu, hint_quality_cpu
+             del model_chunk, display_chunk, review_chunk
+             flush_before(next_start)
+-            print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
+-        torch.cuda.synchronize()
++        _synchronize(device)
+         flush_before(T_all + 1)
+     finally:
++        for handle in hook_handles:
++            handle.remove()
++        stage1_progress.close()
+         reader.close()
+         if hint_reader is not None:
+             hint_reader.close()
+@@ -575,7 +809,7 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
+     if baton_fp16 is not None:
+         baton_fp16.flush()
+     del baton_fp16, live_acc, live_w, rvm_map, cradio_map, moge_map
+-    torch.cuda.empty_cache()
++    _empty_accelerator_cache(device)
+ 
+ 
+ def _crop_native_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
+@@ -733,6 +967,8 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
+ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
+                   hint_video_path: str | None):
++    inference_started = time.perf_counter()
++    device = model._accelerator_device
+     input_path = str(input_path)
+     output_dir = str(output_dir)
+     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
+@@ -763,7 +999,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+     T_all = int(meta["num_frames"])
+     H, W = meta["shape_hw"]
+     if cfg.auto_vram:
+-        apply_auto_vram(cfg, (H, W), T_all)
++        apply_auto_vram(cfg, (H, W), T_all, device)
+     H_out, W_out = meta["output_hw"]
+     meta["cutout_linear"] = cfg.cutout_linear
+     meta["despill_strength"] = cfg.despill_strength
+@@ -772,6 +1008,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+     checker = make_checker(H_out, W_out)
+     checker_t = torch.from_numpy(checker)
+     writers = {}
++    stage2_progress = None
+     suffix = {
+         "alpha": "alpha",
+         "fg": "fg",
+@@ -839,8 +1076,17 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+             if none_path(initial_hint_path) is not None else None
+         )
+         _phase1_setup(model, stage1_on_gpu=not cfg.low_vram)
+-        if cfg.low_vram:
+-            configure_low_vram_inference(model, cfg)
++        # MPS scaled-dot-product attention may materialize its full attention
++        # matrix. At HD resolutions, batching the per-frame /16 encoder over a
++        # long Hann window can therefore request well over 100 GB even when the
++        # actual model/activation working set is much smaller. These chunking
++        # knobs are mathematically exact and keep every compute chunk on MPS;
++        # they are independent of the CPU module staging used by --low_vram.
++        if cfg.low_vram or device.type == "mps":
++            configure_low_vram_inference(model, cfg, device=device)
++            if device.type == "mps" and not cfg.low_vram:
++                print("    MPS safe attention chunking enabled "
++                      "(GPU execution remains enabled)")
+         rvm_path = cfg.temp_dir / f"{clip_name}_rvm_feat.f16"
+         baton_path = cfg.temp_dir / f"{clip_name}_baton.f16"
+         foundation_prefix = cfg.temp_dir / f"{clip_name}_foundation"
+@@ -865,25 +1111,28 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+                 reader_kind=reader_kind)
+             model.foundations.cpu()
+             model.stage2.cpu()
+-            model.stage1.cuda()
+-            torch.cuda.empty_cache()
++            model.stage1.to(device)
++            _empty_accelerator_cache(device)
+         else:
+-            model.stage2.cuda()
++            model.stage2.to(device)
+             model.stage2.eval()
+-            torch.cuda.empty_cache()
++            _empty_accelerator_cache(device)
+ 
+         stage2_batch = max(1, int(cfg.stage2_batch))
++        stage2_progress = _inline_progress(
++            total=T_all, desc="    Stage 2 + output", unit="frame")
+ 
+         def write_prediction_batches(items):
+             device = next(model.stage2.parameters()).device
+             for offset in range(0, len(items), stage2_batch):
+                 sub = items[offset:offset + stage2_batch]
+                 rgb_t = torch.stack([item[2] for item in sub], dim=0)
+-                rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
++                rgb_t = rgb_t.unsqueeze(0).to(
++                    device, dtype=_inference_dtype(device), non_blocking=True)
+                 baton_np = np.stack([item[1] for item in sub], axis=0)
+                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
+                 baton_t = baton_t.to(device, non_blocking=True).float()
+-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
++                with torch.inference_mode(), _autocast(device):
+                     logits = model.stage2(rgb_t, baton_t)
+                     if isinstance(logits, tuple):
+                         logits = logits[0]
+@@ -892,6 +1141,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+                 rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
+                 for name, frames in rendered.items():
+                     writers[name].write_many(frames)
++                stage2_progress.update(len(sub))
+                 del logits, baton_t, rgb_t, baton_np, rendered
+ 
+         hann_stage1_stream(
+@@ -926,12 +1176,17 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
+                 reader.close()
+                 del baton
+     finally:
++        if stage2_progress is not None:
++            stage2_progress.close()
+         for writer in writers.values():
+             writer.release()
+         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
+         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
+         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
+         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
+-        torch.cuda.empty_cache()
++        _empty_accelerator_cache(device)
+     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
+           f"({T_all} frames @ {W_out}x{H_out})")
++    elapsed = time.perf_counter() - inference_started
++    print(f"  inference runtime: {elapsed / 60:.1f} min ({elapsed:.1f} s), "
++          f"{T_all / elapsed:.2f} frames/s")
+diff --git a/corridorkey/video_io.py b/corridorkey/video_io.py
+index 16f952b..36db0ee 100644
+--- a/corridorkey/video_io.py
++++ b/corridorkey/video_io.py
+@@ -1,9 +1,10 @@
+ from __future__ import annotations
+ 
+-import glob
++import functools
+ import math
+ import os
+ import queue
++import re
+ import shutil
+ import subprocess
+ import threading
+@@ -63,11 +64,30 @@ def raw_clip_name(path: str | os.PathLike) -> str:
+     return name
+ 
+ 
++_FRAME_EXTS = (".exr", ".png", ".jpg", ".jpeg")
++
++
++def _natural_key(path: str):
++    name = os.path.basename(path)
++    parts = re.split(r"([0-9]+)", name.lower())
++    return [int(part) if index % 2 else part for index, part in enumerate(parts)], name
++
++
+ def frame_paths(frame_dir: str | os.PathLike) -> list[str]:
+-    paths: list[str] = []
+-    for ext in ("*.exr", "*.png", "*.jpg", "*.jpeg"):
+-        paths.extend(glob.glob(os.path.join(str(frame_dir), ext)))
+-    return sorted(paths)
++    """Image frames in ``frame_dir``, in natural (numeric-aware) order.
++
++    Extensions are matched case-insensitively (``.PNG``/``.EXR`` too) and
++    unpadded numbering (``f_2`` before ``f_10``) keeps temporal order.
++    """
++    frame_dir = str(frame_dir)
++    try:
++        names = os.listdir(frame_dir)
++    except (FileNotFoundError, NotADirectoryError):
++        return []
++    paths = [os.path.join(frame_dir, n) for n in names
++             if not n.startswith(".") and n.lower().endswith(_FRAME_EXTS)
++             and os.path.isfile(os.path.join(frame_dir, n))]
++    return sorted(paths, key=_natural_key)
+ 
+ 
+ def ceil_to_multiple(x: int, q: int) -> int:
+@@ -296,9 +316,66 @@ def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
+     return meta
+ 
+ 
++@functools.lru_cache(maxsize=8)
++def _uint8_view_luts(gain: float, contrast: float, pivot: float):
++    """bfloat16 bit patterns of each preprocessed view for all 256 code values.
++
++    Without a resize every view is a pure per-pixel function of the 8-bit code
++    value, so the float sRGB decode and asinh encode only need to run 256 times
++    instead of once per pixel. The tables are built by the same functions as
++    the float path, so the resulting tensors are identical.
++    """
++    meta = {"linear_brightness": gain, "linear_contrast": contrast,
++            "linear_contrast_pivot": pivot}
++    # Repeat each code so it is evaluated by the same vectorized kernels as a
++    # full frame rather than by a scalar tail loop.
++    rep = 64
++    frame = np.repeat(np.arange(256, dtype=np.uint8), rep).astype(np.float32) / 255.0
++    linear_model = apply_linear_adjust(cu.srgb_to_linear(frame), meta)
++
++    def bits(x: np.ndarray) -> np.ndarray:
++        t = torch.from_numpy(np.ascontiguousarray(x[::rep]))
++        return t.to(dtype=torch.bfloat16).view(torch.int16).numpy()
++
++    review = bits(frame)
++    foundation = (bits(cu.linear_to_vfm_sdr(linear_model))
++                  if has_linear_adjust(meta) else review)
++    return bits(cu.linear_to_asinh(linear_model)), foundation, review
++
++
++def _lut_to_bf16(chw_u8: np.ndarray, lut_bits: np.ndarray) -> torch.Tensor:
++    out = cv2.LUT(chw_u8.reshape(-1, chw_u8.shape[-1]), lut_bits)
++    return torch.from_numpy(out.reshape(chw_u8.shape)).view(torch.bfloat16)
++
++
++def _preprocess_uint8_bgr_views(frame_bgr: np.ndarray, meta: dict, *,
++                                need_model: bool):
++    """Table-lookup equivalent of the float path for unscaled 8-bit frames."""
++    h_out, w_out = meta["shape_hw"]
++    # Reflect padding copies pixels, so it commutes with the per-pixel lookup.
++    padded, _ = center_pad_to_shape(frame_bgr, h_out, w_out)
++    chw = np.ascontiguousarray(padded.transpose(2, 0, 1)[::-1])
++    model_lut, foundation_lut, review_lut = _uint8_view_luts(
++        float(meta.get("linear_brightness", 1.0)),
++        float(meta.get("linear_contrast", 1.0)),
++        float(meta.get("linear_contrast_pivot", 0.18)))
++    review = _lut_to_bf16(chw, review_lut)
++    foundation = (review if foundation_lut is review_lut
++                  else _lut_to_bf16(chw, foundation_lut))
++    model = _lut_to_bf16(chw, model_lut) if need_model else None
++    return model, foundation, review
++
++
++def _is_unscaled_uint8_bgr(frame, meta: dict) -> bool:
++    return (frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3
++            and frame.shape[:2] == tuple(meta["model_native_hw"]))
++
++
+ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
+     h_out, w_out = meta["shape_hw"]
+     h_model, w_model = meta["model_native_hw"]
++    if _is_unscaled_uint8_bgr(frame_bgr, meta):
++        return _preprocess_uint8_bgr_views(frame_bgr, meta, need_model=need_model)
+     frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+     frame = resize_hwc_lanczos(frame, (h_model, w_model))
+     frame, _ = center_pad_to_shape(frame, h_out, w_out)
+@@ -323,6 +400,17 @@ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
+ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
+     h_out, w_out = meta["shape_hw"]
+     h_model, w_model = meta["model_native_hw"]
++    if (not meta.get("exr_linear", False)
++            and not has_linear_adjust(meta)
++            and tuple(meta.get("native_hw", (h_model, w_model))) == (h_model, w_model)
++            and not str(path).lower().endswith(".exr")):
++        # Unscaled sRGB stills with default adjustments can use the video LUT.
++        frame_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
++        if frame_bgr is None:
++            raise FileNotFoundError(path)
++        if _is_unscaled_uint8_bgr(frame_bgr, meta):
++            return _preprocess_uint8_bgr_views(
++                frame_bgr, meta, need_model=need_model)
+     display, linear = _read_frame_dir_views(
+         path, exr_linear=bool(meta.get("exr_linear", False)))
+     display = resize_hwc_lanczos(display, (h_model, w_model))
+diff --git a/infer.py b/infer.py
+index 1793a57..35ff896 100755
+--- a/infer.py
++++ b/infer.py
+@@ -4,9 +4,13 @@ from __future__ import annotations
+ import argparse
+ import os
+ import tempfile
++import time
+ 
+ os.environ["HF_HUB_OFFLINE"] = "1"
+ os.environ["TRANSFORMERS_OFFLINE"] = "1"
++# Never hide an unsupported Metal operator by running it on the CPU.  This
++# must be set before importing torch.
++os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+ 
+ from pathlib import Path
+ 
+@@ -17,6 +21,7 @@ from corridorkey.runtime import (
+     RuntimePaths,
+     WriterConfig,
+     load_model,
++    select_accelerator,
+     run_inference,
+ )
+ from corridorkey.video_io import require_ffmpeg
+@@ -44,11 +49,14 @@ def _parse_outputs(values):
+ 
+ 
+ def main():
++    total_started = time.perf_counter()
+     ap = argparse.ArgumentParser(
+         description="CorridorKey v2 native-resolution raw-video inference")
+     ap.add_argument("--input", required=True,
+                     help="Input video file or directory of image frames.")
+     ap.add_argument("--output_dir", required=True)
++    ap.add_argument("--device", choices=("auto", "cuda", "mps"), default="auto",
++                    help="Inference accelerator. Default: CUDA when available, otherwise MPS.")
+     ap.add_argument("--weights", default=None,
+                     help="Runtime checkpoint (.safetensors or legacy .pt). "
+                          "Defaults to weights/corridorkey_v2.safetensors.")
+@@ -117,8 +125,8 @@ def main():
+                     default=2048)
+     args = ap.parse_args()
+ 
+-    if not torch.cuda.is_available():
+-        raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
++    device = select_accelerator(args.device)
++    print(f"Using accelerator: {device}")
+     require_ffmpeg(args.ffmpeg_bin)
+     package_root = Path(__file__).resolve().parent
+     paths = RuntimePaths.from_package(package_root, args.weights)
+@@ -166,7 +174,7 @@ def main():
+         output_format=args.output_format,
+         exr_dtype=args.exr_dtype,
+     )
+-    model = load_model(paths, device="cuda")
++    model = load_model(paths, device=device)
+     run_inference(
+         model,
+         args.input,
+@@ -176,6 +184,9 @@ def main():
+         initial_hint_path=args.hint_first_frame,
+         hint_video_path=args.hint_video,
+     )
++    elapsed = time.perf_counter() - total_started
++    print(f"Total runtime (including model load): {elapsed / 60:.1f} min "
++          f"({elapsed:.1f} s)")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/requirements.txt b/requirements.txt
+index f928d90..1b9ca34 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,6 +5,7 @@ timm>=1.0
+ safetensors>=0.6
+ huggingface-hub>=0.36
+ einops>=0.8
++certifi
+ scipy>=1.16
+ pillow>=11
+ tqdm>=4.67
+diff --git a/run_interactive.py b/run_interactive.py
+index 632ee0f..6294b1f 100755
+--- a/run_interactive.py
++++ b/run_interactive.py
+@@ -270,7 +270,15 @@ def main():
+         # ======================================================================
+         batch_clips = get_batch_clips(input_path)
+         if not batch_clips:
+-            print(f"{Colors.YELLOW}[ERROR] Directory contains no supported video clips or frame subdirectories: {input_path}{Colors.RESET}")
++            print(
++                f"{Colors.YELLOW}[ERROR] Directory contains no supported video clips "
++                f"or image-sequence folders: {input_path}\n"
++                "Image sequences must be placed inside a subdirectory named "
++                "'input', using this layout:\n"
++                "  <sequence-folder>/input/<frame files>\n"
++                "Pass or drag <sequence-folder> to this launcher, not the input/ "
++                f"directory itself.{Colors.RESET}"
++            )
+             sys.exit(1)
+             
+         print(f"Found {Colors.GREEN}{len(batch_clips)}{Colors.RESET} clips to process in batch.")
+@@ -548,9 +556,11 @@ def main():
+                 env["HF_HUB_OFFLINE"] = "1"
+                 env["TRANSFORMERS_OFFLINE"] = "1"
+                 
+-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+-                for line in process.stdout:
+-                    print(line, end="")
++                # Inherit the terminal directly. Reading text through PIPE
++                # enables universal-newline translation, which turns the
++                # inference progress display's carriage returns into newlines
++                # and makes every refresh scroll on macOS terminals.
++                process = subprocess.Popen(cmd, env=env)
+                 process.wait()
+                 
+                 if process.returncode == 0:
+@@ -922,9 +932,9 @@ def main():
+                 env["HF_HUB_OFFLINE"] = "1"
+                 env["TRANSFORMERS_OFFLINE"] = "1"
+                 
+-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+-                for line in process.stdout:
+-                    print(line, end="")
++                # Keep stdout/stderr attached to the user's terminal so inline
++                # carriage-return progress updates remain on one line.
++                process = subprocess.Popen(cmd, env=env)
+                 process.wait()
+                 
+                 if process.returncode == 0:
+diff --git a/scripts/download_weights.py b/scripts/download_weights.py
+index 226e937..4da63ee 100644
+--- a/scripts/download_weights.py
++++ b/scripts/download_weights.py
+@@ -19,6 +19,7 @@ import argparse
+ import base64
+ import hashlib
+ import shutil
++import ssl
+ import urllib.request
+ from pathlib import Path
+ 
+@@ -67,6 +68,15 @@ def download_moge(root: Path) -> None:
+     hf_hub_download(MOGE_REPO, "model.pt", revision=MOGE_REVISION, local_dir=root / "vfms/moge")
+ 
+ 
++def _ssl_context() -> ssl.SSLContext:
++    """Supplement system trust with certifi when the default CA file is missing."""
++    context = ssl.create_default_context()
++    if ssl.get_default_verify_paths().cafile is None:
++        import certifi
++        context.load_verify_locations(cafile=certifi.where())
++    return context
++
++
+ def download_rvm(root: Path) -> None:
+     dst = root / "vfms/rvm" / RVM_FILE
+     if dst.is_file() and _md5_b64(dst) == RVM_MD5_B64:
+@@ -75,7 +85,7 @@ def download_rvm(root: Path) -> None:
+     print(f"[rvm] {RVM_URL}")
+     dst.parent.mkdir(parents=True, exist_ok=True)
+     tmp = dst.with_suffix(dst.suffix + ".part")
+-    with urllib.request.urlopen(RVM_URL) as response, open(tmp, "wb") as f:
++    with urllib.request.urlopen(RVM_URL, context=_ssl_context()) as response, open(tmp, "wb") as f:
+         shutil.copyfileobj(response, f, length=1 << 20)
+     if _md5_b64(tmp) != RVM_MD5_B64:
+         tmp.unlink()
+diff --git a/scripts/smoke_test_runtime.py b/scripts/smoke_test_runtime.py
+index bbb06fe..acbfdef 100755
+--- a/scripts/smoke_test_runtime.py
++++ b/scripts/smoke_test_runtime.py
+@@ -6,6 +6,8 @@ import os
+ import sys
+ from pathlib import Path
+ 
++os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
++
+ import torch
+ 
+ 
+@@ -13,6 +15,7 @@ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--package_root", default=str(Path(__file__).resolve().parents[1]))
+     ap.add_argument("--load_model", action="store_true")
++    ap.add_argument("--device", choices=("auto", "cuda", "mps"), default="auto")
+     args = ap.parse_args()
+ 
+     root = Path(args.package_root).resolve()
+@@ -20,7 +23,9 @@ def main():
+     os.environ["HF_HUB_OFFLINE"] = "1"
+     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+ 
+-    from corridorkey.runtime import RuntimePaths, load_model, load_runtime_checkpoint
++    from corridorkey.runtime import (
++        RuntimePaths, load_model, load_runtime_checkpoint, select_accelerator,
++    )
+ 
+     paths = RuntimePaths.from_package(root)
+     paths.validate()
+@@ -38,9 +43,8 @@ def main():
+     print(f"checkpoint ok: {paths.weights} ({paths.weights.stat().st_size / 1e9:.2f} GB)")
+     print(f"state tensors: {len(state)}")
+     if args.load_model:
+-        if not torch.cuda.is_available():
+-            raise RuntimeError("--load_model requires CUDA")
+-        model = load_model(paths, device="cuda")
++        device = select_accelerator(args.device)
++        model = load_model(paths, device=device)
+         print(f"model ok: d16={model.stage1.d_16}, "
+               f"cradio={model.stage1.cradio_dim}, "
+               f"moge={model.stage1.moge_dim}, "
+diff --git a/tests/test_frame_paths.py b/tests/test_frame_paths.py
+new file mode 100644
+index 0000000..3ad9309
+--- /dev/null
++++ b/tests/test_frame_paths.py
+@@ -0,0 +1,18 @@
++import importlib.util, os, sys, types
++import pytest
++
++def _load():
++    # import video_io without the heavy package __init__
++    root = os.path.join(os.path.dirname(__file__), "..", "corridorkey")
++    pkg = types.ModuleType("corridorkey"); pkg.__path__ = [root]
++    sys.modules.setdefault("corridorkey", pkg)
++    from corridorkey import video_io
++    return video_io
++
++def test_natural_order_and_case(tmp_path):
++    vio = _load()
++    for n in ["f_10.png", "f_2.png", "f_1.png", "f_3.PNG", "notes.txt"]:
++        (tmp_path / n).write_bytes(b"")
++    (tmp_path / "sub.png").mkdir()
++    got = [os.path.basename(p) for p in vio.frame_paths(tmp_path)]
++    assert got == ["f_1.png", "f_2.png", "f_3.PNG", "f_10.png"]
