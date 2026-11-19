@@ -1,4 +1,4 @@
-# CorridorKey for Avid Media Composer
+# CorridorKey 2.0 for Avid Media Composer
 
 Community plug-in for green- and blue-screen keying with [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0). Inference runs locally on Apple Silicon or NVIDIA GPUs.
 
@@ -24,8 +24,8 @@ The model loads on first render. Mac renders can reuse the cached foreground and
 Sign up at [Avid Developer](https://developer.avid.com/) and set up Avid’s development environment. For this checkout, see the platform instructions above.
 
 ```sh
-git clone --recurse-submodules https://github.com/whatever-industries/corridorkey-avid.git
-cd corridorkey-avid
+git clone --recurse-submodules https://github.com/whatever-industries/corridorkey-2.0-avid.git
+cd corridorkey-2.0-avid
 git -C CorridorKey2.0 apply ../runtime/patches/corridorkey-2.0.patch
 ```
 

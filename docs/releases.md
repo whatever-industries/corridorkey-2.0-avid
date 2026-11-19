@@ -8,8 +8,8 @@ The proposed first release is `v0.1.0`. Use the platform table from [Disc Xplore
 
 | Platform | Package |
 |---|---|
-| **Windows (x64)** | `CorridorKey.Avid_Windows_x64_v0.1.0.exe` |
-| **macOS (Apple Silicon)** | `CorridorKey.Avid_macOS_ARM_v0.1.0.zip` |
+| **Windows (x64)** | `CorridorKey.2.0.Avid_Windows_x64_v0.1.0.exe` |
+| **macOS (Apple Silicon)** | `CorridorKey.2.0.Avid_macOS_ARM_v0.1.0.zip` |
 
 ## Before publishing packages
 

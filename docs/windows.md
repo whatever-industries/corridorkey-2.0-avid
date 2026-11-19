@@ -2,16 +2,20 @@
 
 The Windows effect runs local inference on an NVIDIA GPU. It uses the community Windows port’s CUDA worker and targets Windows 10 22H2 or Windows 11 with an NVIDIA Studio or Game Ready driver. Windows packaging and host validation for this repository are pending.
 
-## Build and use
+## Compile the plug-in
 
-Set up your account and development environment through [Avid Developer](https://developer.avid.com/). Install Visual Studio 2022 with C++ desktop development, CMake, and Git. Follow the [repository setup](../README.md#build-from-source), including the pinned runtime patch, then run the following in PowerShell.
+Set up your account and development environment through [Avid Developer](https://developer.avid.com/). Install Visual Studio 2022 or its Build Tools with **Desktop development with C++**, MSVC v143 x64 tools, and the Windows development headers and libraries. Use CMake 3.21 or later for the Visual Studio 2022 generator. From the repository root, run the following in PowerShell.
 
 ```powershell
 $env:AVX2SDK_ROOT = 'C:\path\to\Avid-development-files'
 .\scripts\build_plugin.ps1
 ```
 
-For a local test installer, install Inno Setup 6 and run `scripts\build_installer.ps1`. The installer fetches CUDA dependencies and model assets during setup. See the [release plan](releases.md) before distributing any installer.
+The Release build produces `plugin\build\bin\Release\CorridorKey.avx`.
+
+## Package and test
+
+For a local test installer, prepare the pinned runtime using the [repository setup](../README.md#build-from-source), install Inno Setup 6, and run `scripts\build_installer.ps1`. The installer fetches CUDA dependencies and model assets during setup. Test setup with Git available to pip for its Git-hosted dependency and ensure `ffmpeg.exe` is on the worker’s PATH. See the [release plan](releases.md) before distributing any installer.
 
 In Media Composer, apply **Corridor Key 2.0** from **Effect Palette → Image** to a green- or blue-screen clip. Open **Effect Editor**.
 
